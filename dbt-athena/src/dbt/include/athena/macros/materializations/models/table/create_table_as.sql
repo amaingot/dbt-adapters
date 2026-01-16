@@ -29,6 +29,7 @@
                                                  external_location,
                                                  temporary,
                                                  ) -%}
+  {%- set is_s3_tables_catalog = relation.database is not none and (relation.database | lower).startswith('s3tablescatalog/') -%}
   {%- set native_drop = config.get('native_drop', default=false) -%}
 
   {%- set contract_config = config.get('contract') -%}
@@ -36,7 +37,9 @@
     {{ get_assert_columns_equivalent(compiled_code) }}
   {%- endif -%}
 
-  {%- if native_drop and table_type == 'iceberg' -%}
+  {%- if is_s3_tables_catalog -%}
+    {% do log('S3 Tables catalog detected, skipping direct S3 delete') %}
+  {%- elif native_drop and table_type == 'iceberg' -%}
     {% do log('Config native_drop enabled, skipping direct S3 delete') %}
   {%- else -%}
     {% do adapter.delete_from_s3(location) %}
@@ -102,7 +105,7 @@
         {%- set bucket_count = none -%}
         {% do log(ignored_bucket_iceberg) %}
       {%- endif -%}
-      {%- if materialized == 'table' and ( 'unique' not in s3_data_naming or external_location is not none) -%}
+      {%- if not is_s3_tables_catalog and materialized == 'table' and ( 'unique' not in s3_data_naming or external_location is not none) -%}
         {%- set error_unique_location_iceberg -%}
           You need to have an unique table location when creating Iceberg table since we use the RENAME feature
           to have near-zero downtime.
@@ -115,7 +118,7 @@
     with (
       table_type='{{ table_type }}',
       is_external={%- if table_type == 'iceberg' -%}false{%- else -%}true{%- endif %},
-    {%- if not work_group_output_location_enforced or table_type == 'iceberg' -%}
+    {%- if (not work_group_output_location_enforced or table_type == 'iceberg') and not is_s3_tables_catalog -%}
       {{ location_property }}='{{ location }}',
     {%- endif %}
     {%- if partitioned_by is not none %}

@@ -4,6 +4,7 @@ from dbt.adapters.athena.utils import (
     clean_sql_comment,
     ellipsis_comment,
     get_chunks,
+    is_s3_tables_catalog,
     is_valid_table_parameter_key,
     stringify_table_parameter_value,
 )
@@ -59,6 +60,20 @@ def test_get_chunks_more_elements_than_chunk():
     chunks = list(get_chunks([1, 2, 3], 4))
     assert chunks[0] == [1, 2, 3]
     assert len(chunks) == 1
+
+
+@pytest.mark.parametrize(
+    ("catalog_name", "expected"),
+    (
+        pytest.param(None, False, id="none"),
+        pytest.param("", False, id="empty"),
+        pytest.param("awsdatacatalog", False, id="not_s3_tables"),
+        pytest.param("s3tablescatalog/my-bucket", True, id="s3_tables"),
+        pytest.param("S3TABLESCATALOG/my-bucket", True, id="case_insensitive"),
+    ),
+)
+def test_is_s3_tables_catalog(catalog_name, expected):
+    assert is_s3_tables_catalog(catalog_name) is expected
 
 
 @pytest.mark.parametrize(

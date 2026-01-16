@@ -1,10 +1,13 @@
 {% macro athena__drop_relation(relation) -%}
+  {%- set is_s3_tables_catalog = relation.database is not none and (relation.database | lower).startswith('s3tablescatalog/') -%}
   {%- set native_drop = config.get('native_drop', default=false) -%}
   {%- set rel_type_object = adapter.get_glue_table_type(relation) -%}
   {%- set rel_type = none if rel_type_object == none else rel_type_object.value -%}
   {%- set natively_droppable = rel_type == 'iceberg_table' or relation.type == 'view' -%}
 
-  {%- if native_drop and natively_droppable -%}
+  {%- if is_s3_tables_catalog -%}
+    {%- do drop_relation_sql(relation) -%}
+  {%- elif native_drop and natively_droppable -%}
     {%- do drop_relation_sql(relation) -%}
   {%- else -%}
     {%- do drop_relation_glue(relation) -%}
@@ -52,6 +55,13 @@
 {% endmacro %}
 
 {% macro athena__rename_relation(from_relation, to_relation) %}
+  {%- set is_s3_tables_catalog = from_relation.database is not none and (from_relation.database | lower).startswith('s3tablescatalog/') -%}
+  {%- if is_s3_tables_catalog -%}
+    {%- set error_rename_not_supported -%}
+      Athena S3 Tables does not support `ALTER TABLE ... RENAME`. dbt-athena falls back to drop + create for `s3tablescatalog/<bucket>` catalogs.
+    {%- endset -%}
+    {%- do exceptions.raise_compiler_error(error_rename_not_supported) -%}
+  {%- endif -%}
   {% call statement('rename_relation') -%}
     alter table {{ from_relation.render_hive() }} rename to `{{ to_relation.schema }}`.`{{ to_relation.identifier }}`
   {%- endcall %}

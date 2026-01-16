@@ -59,6 +59,7 @@ from dbt.adapters.athena.utils import (
     get_catalog_id,
     get_catalog_type,
     get_chunks,
+    is_s3_tables_catalog,
     is_valid_table_parameter_key,
     stringify_table_parameter_value,
 )
@@ -340,11 +341,16 @@ class AthenaAdapter(SQLAdapter):
         """
         Helper function to get a relation via Glue
         """
+        if is_s3_tables_catalog(relation.database):  # type: ignore[arg-type]
+            return None
+
         conn = self.connections.get_thread_connection()
         creds = conn.credentials
         client = conn.handle
 
         data_catalog = self._get_data_catalog(relation.database)  # type:ignore
+        if data_catalog and data_catalog["Type"] != AthenaCatalogType.GLUE.value:
+            return None
         catalog_id = get_catalog_id(data_catalog)
 
         with boto3_client_lock:
@@ -354,10 +360,15 @@ class AthenaAdapter(SQLAdapter):
                 config=get_boto3_config(num_retries=creds.effective_num_retries),
             )
 
+        get_table_kwargs = dict(
+            DatabaseName=relation.schema,
+            Name=relation.identifier,
+        )
+        if catalog_id:
+            get_table_kwargs["CatalogId"] = catalog_id
+
         try:
-            table = glue_client.get_table(
-                CatalogId=catalog_id, DatabaseName=relation.schema, Name=relation.identifier
-            )
+            table = glue_client.get_table(**get_table_kwargs)
         except ClientError as e:
             if e.response["Error"]["Code"] == "EntityNotFoundException":
                 LOGGER.debug(f"Table {relation.render()} does not exists - Ignoring")
@@ -370,6 +381,25 @@ class AthenaAdapter(SQLAdapter):
         """
         Get the table type of the relation from Glue
         """
+        if is_s3_tables_catalog(relation.database):  # type: ignore[arg-type]
+            # S3 Tables are Iceberg-based, but are not addressable via Glue APIs.
+            return TableType.ICEBERG
+
+        data_catalog = self._get_data_catalog(relation.database)  # type:ignore
+        if data_catalog and data_catalog["Type"] != AthenaCatalogType.GLUE.value:
+            table_metadata = self._get_athena_table_metadata(relation)
+            if not table_metadata:
+                LOGGER.debug(f"Table {relation.render()} does not exist - Ignoring")
+                return None
+            try:
+                return get_table_type(table_metadata)
+            except ValueError:
+                LOGGER.debug(
+                    "Unsupported table type for %s from Athena metadata, defaulting to TABLE",
+                    relation.render(),
+                )
+                return TableType.TABLE
+
         table = self.get_glue_table(relation)
         if not table:
             LOGGER.debug(f"Table {relation.render()} does not exist - Ignoring")
@@ -716,6 +746,21 @@ class AthenaAdapter(SQLAdapter):
                     )
                 catalog_id = sts.get_caller_identity()["Account"]
                 return {"Name": database, "Type": "GLUE", "Parameters": {"catalog-id": catalog_id}}
+            if database.lower() == "s3tablescatalog":
+                raise DbtRuntimeError(
+                    "Invalid Athena catalog name 's3tablescatalog' (missing bucket name). "
+                    "For S3 Tables, set database/catalog to 's3tablescatalog/<bucket>'."
+                )
+            if is_s3_tables_catalog(database):
+                # `s3tablescatalog/<bucket>` is a special Athena catalog name used for S3 Tables.
+                # It is *not* a real Data Catalog resource, so GetDataCatalog fails. Treat as a
+                # non-Glue catalog so we rely on Athena metadata APIs/INFORMATION_SCHEMA.
+                return {
+                    "Name": database,
+                    "Type": AthenaCatalogType.HIVE.value,
+                    "Parameters": {"catalog": database},
+                }
+
             with boto3_client_lock:
                 athena = client.session.client(
                     "athena",
@@ -725,14 +770,57 @@ class AthenaAdapter(SQLAdapter):
             return athena.get_data_catalog(Name=database)["DataCatalog"]
         return None
 
+    def _get_athena_table_metadata(self, relation: AthenaRelation) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve table metadata via the Athena APIs.
+
+        This is required for non-Glue catalogs (e.g., Federated Query, S3 Tables) where the Glue
+        APIs do not apply.
+        """
+        conn = self.connections.get_thread_connection()
+        creds = conn.credentials
+        client = conn.handle
+
+        with boto3_client_lock:
+            athena_client = client.session.client(
+                "athena",
+                region_name=client.region_name,
+                config=get_boto3_config(num_retries=creds.effective_num_retries),
+            )
+
+        try:
+            return athena_client.get_table_metadata(
+                CatalogName=relation.database,
+                DatabaseName=relation.schema,
+                TableName=relation.identifier,
+            ).get("TableMetadata")
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "")
+            if error_code in {
+                "MetadataException",
+                "InvalidRequestException",
+                "ResourceNotFoundException",
+                "EntityNotFoundException",
+            }:
+                LOGGER.debug(
+                    "Table metadata not found for %s (catalog=%s): %s",
+                    relation.render(),
+                    relation.database,
+                    e,
+                )
+                return None
+            raise e
+
     @available
     def list_relations_without_caching(
         self, schema_relation: AthenaRelation
     ) -> List[BaseRelation]:
         data_catalog = self._get_data_catalog(schema_relation.database)  # type:ignore
         if data_catalog and data_catalog["Type"] != "GLUE":
-            # For non-Glue Data Catalogs, use the original Athena query against INFORMATION_SCHEMA approach
-            return super().list_relations_without_caching(schema_relation)
+            # NOTE: Do not call SQLAdapter.list_relations_without_caching here, as it executes the
+            # `list_relations_without_caching` macro which dispatches back to this adapter, causing
+            # infinite recursion. Instead, query INFORMATION_SCHEMA directly.
+            return self._list_relations_without_caching_information_schema(schema_relation)
 
         conn = self.connections.get_thread_connection()
         creds = conn.credentials
@@ -786,6 +874,43 @@ class AthenaAdapter(SQLAdapter):
             )
         return relations
 
+    def _list_relations_without_caching_information_schema(
+        self, schema_relation: AthenaRelation
+    ) -> List[BaseRelation]:
+        schema = schema_relation.schema or ""
+        # Table schema names are treated as case-insensitive by Athena, but we avoid transforming
+        # here to preserve user intent and match INFORMATION_SCHEMA values.
+        schema_literal = schema.replace("'", "''")
+
+        sql = dedent(
+            f"""
+            select
+              table_name as name,
+              table_type as type
+            from information_schema.tables
+            where table_schema = '{schema_literal}'
+            """
+        ).strip()
+
+        _, table = self.execute(sql, fetch=True)
+
+        relations: List[BaseRelation] = []
+        quote_policy = {"database": True, "schema": True, "identifier": True}
+        for row in table.rows:
+            name = str(row["name"])
+            type_str = str(row["type"]).lower()
+            rel_type = self.Relation.View if "view" in type_str else self.Relation.Table
+            relations.append(
+                self.Relation.create(
+                    schema=schema_relation.schema,
+                    database=schema_relation.database,
+                    identifier=name,
+                    quote_policy=quote_policy,
+                    type=rel_type,
+                )
+            )
+        return relations
+
     def _get_one_catalog_by_relations(
         self,
         information_schema: InformationSchema,
@@ -796,14 +921,36 @@ class AthenaAdapter(SQLAdapter):
         Overwrite of _get_one_catalog_by_relations for Athena, in order to use glue apis.
         This function is invoked by Adapter.get_catalog_by_relations.
         """
-        _table_definitions = []
+        _table_definitions: List[Dict[str, Any]] = []
         for _rel in relations:
+            if is_s3_tables_catalog(_rel.database):  # type: ignore[arg-type]
+                table_metadata = self._get_athena_table_metadata(_rel)
+                if table_metadata:
+                    _table_definitions.extend(
+                        self._get_one_table_for_non_glue_catalog(
+                            table_metadata, _rel.schema, _rel.database  # type:ignore
+                        )
+                    )
+                continue
+
+            data_catalog = self._get_data_catalog(_rel.database)  # type:ignore
+            if data_catalog and data_catalog["Type"] != AthenaCatalogType.GLUE.value:
+                table_metadata = self._get_athena_table_metadata(_rel)
+                if table_metadata:
+                    _table_definitions.extend(
+                        self._get_one_table_for_non_glue_catalog(
+                            table_metadata, _rel.schema, _rel.database  # type:ignore
+                        )
+                    )
+                continue
+
             glue_table_definition = self.get_glue_table(_rel)
             if glue_table_definition:
-                _table_definition = self._get_one_table_for_catalog(
-                    glue_table_definition["Table"], _rel.database  # type:ignore
+                _table_definitions.extend(
+                    self._get_one_table_for_catalog(
+                        glue_table_definition["Table"], _rel.database  # type:ignore
+                    )
                 )
-                _table_definitions.extend(_table_definition)
         table = agate.Table.from_object(_table_definitions)
         # picked from _catalog_filter_table, force database + schema to be strings
         return table_from_rows(
@@ -952,6 +1099,13 @@ class AthenaAdapter(SQLAdapter):
         client = conn.handle
 
         data_catalog = self._get_data_catalog(relation.database)  # type:ignore
+        if not data_catalog or data_catalog["Type"] != AthenaCatalogType.GLUE.value:
+            LOGGER.debug(
+                "Skipping Glue table version expiration for %s (catalog=%s)",
+                relation.render(),
+                relation.database,
+            )
+            return []
         catalog_id = get_catalog_id(data_catalog)
 
         with boto3_client_lock:
@@ -960,7 +1114,9 @@ class AthenaAdapter(SQLAdapter):
                 region_name=client.region_name,
                 config=get_boto3_config(num_retries=creds.effective_num_retries),
             )
-
+        LOGGER.debug(
+            f"Expiring table versions for {relation.render()} keeping the latest {to_keep} versions"
+        )
         versions_to_delete = self._get_glue_table_versions_to_expire(relation, to_keep)
         LOGGER.debug(f"Versions to delete: {[v['VersionId'] for v in versions_to_delete]}")
 
@@ -969,12 +1125,14 @@ class AthenaAdapter(SQLAdapter):
             version = v["Table"]["VersionId"]
             location = v["Table"]["StorageDescriptor"]["Location"]
             try:
-                glue_client.delete_table_version(
-                    CatalogId=catalog_id,
-                    DatabaseName=relation.schema,
-                    TableName=relation.identifier,
-                    VersionId=str(version),
-                )
+                delete_kwargs = {
+                    "DatabaseName": relation.schema,
+                    "TableName": relation.identifier,
+                    "VersionId": str(version),
+                }
+                if catalog_id:
+                    delete_kwargs["CatalogId"] = catalog_id
+                glue_client.delete_table_version(**delete_kwargs)
                 deleted_versions.append(version)
                 LOGGER.debug(f"Deleted version {version} of table {relation.render()} ")
                 if delete_s3:
@@ -1013,6 +1171,12 @@ class AthenaAdapter(SQLAdapter):
         client = conn.handle
 
         data_catalog = self._get_data_catalog(relation.database)  # type:ignore
+        if data_catalog and data_catalog["Type"] != AthenaCatalogType.GLUE.value:
+            LOGGER.debug(
+                "Skipping persist_docs_to_glue for non-Glue catalog %s",
+                relation.database,
+            )
+            return
         catalog_id = get_catalog_id(data_catalog)
 
         with boto3_client_lock:
@@ -1181,6 +1345,29 @@ class AthenaAdapter(SQLAdapter):
         client = conn.handle
 
         data_catalog = self._get_data_catalog(relation.database)  # type:ignore
+        if data_catalog and data_catalog["Type"] != AthenaCatalogType.GLUE.value:
+            table_metadata = self._get_athena_table_metadata(relation)
+            if not table_metadata:
+                return []
+
+            table_type = (
+                TableType.ICEBERG
+                if is_s3_tables_catalog(relation.database)  # type: ignore[arg-type]
+                else TableType.TABLE
+            )
+            try:
+                detected_table_type = get_table_type(table_metadata)
+                if not is_s3_tables_catalog(relation.database) or detected_table_type == TableType.ICEBERG:  # type: ignore[arg-type]
+                    table_type = detected_table_type
+            except ValueError:
+                pass
+
+            columns = table_metadata.get("Columns", []) + table_metadata.get("PartitionKeys", [])
+            return [
+                AthenaColumn(column=c["Name"], dtype=c["Type"], table_type=table_type)
+                for c in columns
+            ]
+
         catalog_id = get_catalog_id(data_catalog)
 
         with boto3_client_lock:

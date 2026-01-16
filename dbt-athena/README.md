@@ -39,33 +39,45 @@ For more information on using dbt with Athena, consult [the docs](https://docs.g
 # Contents
 
 <!-- TOC -->
+- [dbt](#dbt)
+  - [dbt-athena](#dbt-athena)
+- [Contents](#contents)
 - [Features](#features)
-    - [Quick start](#quick-start)
-        - [Installation](#installation)
-        - [Prerequisites](#prerequisites)
-        - [Credentials](#credentials)
-        - [Configuring your profile](#configuring-your-profile)
-        - [Additional information](#additional-information)
-    - [Models](#models)
-        - [Table configuration](#table-configuration)
-        - [Table location](#table-location)
-        - [Incremental models](#incremental-models)
-        - [On schema change](#on-schema-change)
-        - [Iceberg](#iceberg)
-        - [Highly available table (HA)](#highly-available-table-ha)
-            - [HA known issues](#ha-known-issues)
-        - [Update glue data catalog](#update-glue-data-catalog)
-    - [Snapshots](#snapshots)
-        - [Timestamp strategy](#timestamp-strategy)
-        - [Check strategy](#check-strategy)
-        - [Hard-deletes](#hard-deletes)
-        - [Working example](#working-example)
-        - [Snapshots known issues](#snapshots-known-issues)
-    - [AWS Lake Formation integration](#aws-lake-formation-integration)
-    - [Python models](#python-models)
-    - [Contracts](#contracts)
-    - [Contributing](#contributing)
-    - [Contributors ✨](#contributors-)
+  - [Quick start](#quick-start)
+    - [Installation](#installation)
+    - [Prerequisites](#prerequisites)
+    - [Credentials](#credentials)
+    - [Configuring your profile](#configuring-your-profile)
+    - [Additional information](#additional-information)
+  - [Models](#models)
+    - [Table configuration](#table-configuration)
+    - [Table location](#table-location)
+    - [Incremental models](#incremental-models)
+    - [On schema change](#on-schema-change)
+    - [Iceberg](#iceberg)
+    - [Highly available table (HA)](#highly-available-table-ha)
+      - [HA known issues](#ha-known-issues)
+    - [Update glue data catalog](#update-glue-data-catalog)
+  - [Snapshots](#snapshots)
+    - [Timestamp strategy](#timestamp-strategy)
+    - [Check strategy](#check-strategy)
+    - [Hard-deletes](#hard-deletes)
+    - [Working example](#working-example)
+    - [Snapshots known issues](#snapshots-known-issues)
+  - [AWS Lake Formation integration](#aws-lake-formation-integration)
+  - [Python models](#python-models)
+    - [Setup](#setup)
+    - [Spark-specific table configuration](#spark-specific-table-configuration)
+    - [Spark notes](#spark-notes)
+    - [Example models](#example-models)
+      - [Simple pandas model](#simple-pandas-model)
+      - [Simple spark](#simple-spark)
+      - [Spark incremental](#spark-incremental)
+      - [Config spark model](#config-spark-model)
+      - [Create pySpark udf using imported external python files](#create-pyspark-udf-using-imported-external-python-files)
+    - [Known issues in Python models](#known-issues-in-python-models)
+  - [Contracts](#contracts)
+  - [Contribute](#contribute)
 <!-- TOC -->
 
 # Features
@@ -147,7 +159,7 @@ A dbt profile can be configured to run against AWS Athena using the following co
 | s3_tmp_table_dir      | Prefix for storing temporary tables, if different from the connection's `s3_data_dir`    | Optional  | `s3://bucket3/dbt/`                        |
 | region_name           | AWS region of your Athena instance                                                       | Required  | `eu-west-1`                                |
 | schema                | Specify the schema (Athena database) to build models into (lowercase **only**)           | Required  | `dbt`                                      |
-| database              | Specify the database (Data catalog) to build models into (lowercase **only**)            | Required  | `awsdatacatalog`                           |
+| database              | Specify the database (Data catalog) to build models into (lowercase **only**)            | Required  | `awsdatacatalog` / `s3tablescatalog/<bucket>` |
 | poll_interval         | Interval in seconds to use for polling the status of query results in Athena             | Optional  | `5`                                        |
 | debug_query_state     | Flag if debug message with Athena query state is needed                                  | Optional  | `false`                                    |
 | aws_access_key_id     | Access key ID of the user performing requests                                            | Optional  | `AKIAIOSFODNN7EXAMPLE`                     |
@@ -189,6 +201,8 @@ athena:
 
 - `threads` is supported
 - `database` and `catalog` can be used interchangeably
+- To target S3 Tables, set `database`/`catalog` to `s3tablescatalog/<bucket>` (Glue APIs are not used for this catalog)
+- Athena does not support `ALTER TABLE ... RENAME` for S3 Tables, so dbt-athena falls back to drop + create when replacing tables in `s3tablescatalog/<bucket>`
 
 ## Models
 

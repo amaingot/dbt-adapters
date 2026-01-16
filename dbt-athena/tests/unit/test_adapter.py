@@ -33,6 +33,7 @@ from .constants import (
     DATABASE_NAME,
     FEDERATED_QUERY_CATALOG_NAME,
     S3_STAGING_DIR,
+    S3_TABLES_CATALOG_NAME,
     SHARED_DATA_CATALOG_NAME,
 )
 from .fixtures import seed_data
@@ -676,6 +677,22 @@ class TestAthenaAdapter:
             "Parameters": {"catalog-id": DEFAULT_ACCOUNT_ID},
         } == res
 
+    @mock_aws
+    def test__get_data_catalog_s3_tables_catalog(self, mock_aws_service):
+        self.adapter.acquire_connection("dummy")
+        res = self.adapter._get_data_catalog(S3_TABLES_CATALOG_NAME)
+        assert {
+            "Name": S3_TABLES_CATALOG_NAME,
+            "Type": AthenaCatalogType.HIVE.value,
+            "Parameters": {"catalog": S3_TABLES_CATALOG_NAME},
+        } == res
+
+    @mock_aws
+    def test__get_data_catalog_s3_tables_catalog_missing_bucket_raises(self, mock_aws_service):
+        self.adapter.acquire_connection("dummy")
+        with pytest.raises(DbtRuntimeError, match=r"missing bucket"):
+            self.adapter._get_data_catalog("s3tablescatalog")
+
     def _test_list_relations_without_caching(self, schema_relation):
         self.adapter.acquire_connection("dummy")
         relations = self.adapter.list_relations_without_caching(schema_relation)
@@ -744,9 +761,12 @@ class TestAthenaAdapter:
         assert relations == []
 
     @mock_aws
-    @patch("dbt.adapters.athena.impl.SQLAdapter.list_relations_without_caching", return_value=[])
+    @patch(
+        "dbt.adapters.athena.impl.AthenaAdapter._list_relations_without_caching_information_schema",
+        return_value=[],
+    )
     def test_list_relations_without_caching_with_non_glue_data_catalog(
-        self, parent_list_relations_without_caching, mock_aws_service
+        self, list_relations_information_schema, mock_aws_service
     ):
         data_catalog_name = "other_data_catalog"
         mock_aws_service.create_data_catalog(data_catalog_name, AthenaCatalogType.HIVE)
@@ -757,7 +777,7 @@ class TestAthenaAdapter:
         )
         self.adapter.acquire_connection("dummy")
         self.adapter.list_relations_without_caching(schema_relation)
-        parent_list_relations_without_caching.assert_called_once_with(schema_relation)
+        list_relations_information_schema.assert_called_once_with(schema_relation)
 
     @pytest.mark.parametrize(
         "s3_path,expected",
@@ -1169,6 +1189,48 @@ class TestAthenaAdapter:
             AthenaColumn(column="id", dtype="string", table_type=TableType.TABLE),
             AthenaColumn(column="country", dtype="string", table_type=TableType.TABLE),
             AthenaColumn(column="dt", dtype="date", table_type=TableType.TABLE),
+        ]
+
+    @mock_aws
+    def test_get_columns_in_relation_s3_tables_catalog(self, mock_aws_service):
+        self.adapter.acquire_connection("dummy")
+        relation = self.adapter.Relation.create(
+            database=S3_TABLES_CATALOG_NAME,
+            schema=DATABASE_NAME,
+            identifier="tbl_name",
+        )
+
+        orig = botocore.client.BaseClient._make_api_call
+
+        # Moto doesn't currently implement GetTableMetadata.
+        def mock_athena_get_table_metadata(self, operation_name, kwarg):
+            if operation_name == "GetTableMetadata":
+                assert kwarg["CatalogName"] == S3_TABLES_CATALOG_NAME
+                assert kwarg["DatabaseName"] == DATABASE_NAME
+                assert kwarg["TableName"] == "tbl_name"
+                return {
+                    "TableMetadata": {
+                        "Name": "tbl_name",
+                        "TableType": "EXTERNAL_TABLE",
+                        "Parameters": {"table_type": "ICEBERG"},
+                        "Columns": [
+                            {"Name": "id", "Type": "string"},
+                            {"Name": "country", "Type": "string"},
+                        ],
+                        "PartitionKeys": [{"Name": "dt", "Type": "date"}],
+                    }
+                }
+            return orig(self, operation_name, kwarg)
+
+        with patch(
+            "botocore.client.BaseClient._make_api_call", new=mock_athena_get_table_metadata
+        ):
+            columns = self.adapter.get_columns_in_relation(relation)
+
+        assert columns == [
+            AthenaColumn(column="id", dtype="string", table_type=TableType.ICEBERG),
+            AthenaColumn(column="country", dtype="string", table_type=TableType.ICEBERG),
+            AthenaColumn(column="dt", dtype="date", table_type=TableType.ICEBERG),
         ]
 
     @mock_aws

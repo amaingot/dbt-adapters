@@ -7,6 +7,7 @@
   {%- set lf_grants = config.get('lf_grants') -%}
 
   {%- set table_type = config.get('table_type', default='hive') | lower -%}
+  {%- set is_s3_tables_catalog = database is not none and (database | lower).startswith('s3tablescatalog/') -%}
   {%- set old_relation = adapter.get_relation(database=database, schema=schema, identifier=identifier) -%}
   {%- set old_tmp_relation = adapter.get_relation(identifier=identifier ~ '__ha',
                                              schema=schema,
@@ -70,7 +71,9 @@
       -- delete glue tmp table, do not use drop_relation, as it will remove data of the target table
       {%- do adapter.delete_from_glue_catalog(tmp_relation) -%}
 
-      {% do adapter.expire_glue_table_versions(target_relation, versions_to_keep, True) %}
+      {% if not is_s3_tables_catalog %}
+        {% do adapter.expire_glue_table_versions(target_relation, versions_to_keep, True) %}
+      {% endif %}
 
     {%- else -%}
       -- Here we are in the case of non-ha tables or ha tables but in case of full refresh.
@@ -92,6 +95,23 @@
   {%- else -%}
 
     {%- if old_relation is none -%}
+      {%- set query_result = safe_create_table_as(False, target_relation, compiled_code, language, force_batch) -%}
+      -- Execute python code that is available in query result object
+      {%- if language == 'python' -%}
+        {% call statement('create_table', language=language) %}
+          {{ query_result }}
+        {% endcall %}
+      {%- endif -%}
+    {%- elif is_s3_tables_catalog -%}
+      -- Athena S3 Tables does not support `ALTER TABLE ... RENAME`, so we cannot do the normal
+      -- Iceberg swap/backup behavior. Fall back to drop + create.
+      {%- if old_tmp_relation is not none -%}
+        {%- do drop_relation(old_tmp_relation) -%}
+      {%- endif -%}
+      {%- if old_bkp_relation is not none -%}
+        {%- do drop_relation(old_bkp_relation) -%}
+      {%- endif -%}
+      {%- do drop_relation(old_relation) -%}
       {%- set query_result = safe_create_table_as(False, target_relation, compiled_code, language, force_batch) -%}
       -- Execute python code that is available in query result object
       {%- if language == 'python' -%}

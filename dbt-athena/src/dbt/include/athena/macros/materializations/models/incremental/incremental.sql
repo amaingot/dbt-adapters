@@ -13,6 +13,7 @@
   {% set unique_tmp_table_suffix = config.get('unique_tmp_table_suffix', False) | as_bool -%}
   {% set temp_schema = config.get('temp_schema') %}
   {% set target_relation = this.incorporate(type='table') %}
+  {% set is_s3_tables_catalog = target_relation.database is not none and (target_relation.database | lower).startswith('s3tablescatalog/') %}
   {% set existing_relation = load_relation(this) %}
   {% set s3_data_naming = config.get('s3_data_naming', default=target.s3_data_naming) %}
   -- If using insert_overwrite on Hive table, allow to set a unique tmp table suffix
@@ -66,11 +67,12 @@
   -- Running in full refresh, support High Availability for Iceberg table type --
   -- Must use s3_data_naming schema_table_unique in order to support high availability --
   -- on a full fresh for an incremental iceberg table --
-  {%- elif (
-    should_full_refresh()
-    and table_type == 'iceberg'
-    and ('unique' not in s3_data_naming or external_location is not none)
-  ) -%}
+	  {%- elif (
+	    should_full_refresh()
+	    and table_type == 'iceberg'
+	    and not is_s3_tables_catalog
+	    and ('unique' not in s3_data_naming or external_location is not none)
+	  ) -%}
     -- create a new tmp_relation that has its s3 path set to the target location path
     -- except with a unique UUID
     -- this allows for once the fully refreshed `tmp_relation` is completed, the `rename_relation()`
@@ -246,7 +248,9 @@
 
   {% do persist_docs(target_relation, model) %}
 
-  {% do adapter.expire_glue_table_versions(target_relation, versions_to_keep, False) %}
+  {% if not is_s3_tables_catalog %}
+    {% do adapter.expire_glue_table_versions(target_relation, versions_to_keep, False) %}
+  {% endif %}
 
   {{ return({'relations': [target_relation]}) }}
 

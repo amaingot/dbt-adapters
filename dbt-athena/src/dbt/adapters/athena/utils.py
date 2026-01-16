@@ -53,6 +53,13 @@ def get_catalog_type(catalog: Optional[DataCatalogTypeDef]) -> Optional[AthenaCa
     return AthenaCatalogType(catalog["Type"]) if catalog else None
 
 
+S3_TABLES_CATALOG_PREFIX = "s3tablescatalog/"
+
+
+def is_s3_tables_catalog(catalog_name: Optional[str]) -> bool:
+    return bool(catalog_name) and catalog_name.lower().startswith(S3_TABLES_CATALOG_PREFIX)
+
+
 T = TypeVar("T")
 
 
