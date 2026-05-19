@@ -1,0 +1,6 @@
+kind: Features
+body: Add support for AWS S3 Tables (managed Apache Iceberg) targets in dbt-athena. Users can set `database: s3tablescatalog/<bucket>` and dbt-athena will route through Athena metadata APIs instead of Glue, omit unsupported CTAS properties, fall back to drop-and-create when `ALTER TABLE RENAME` is needed, and raise clear errors for unsupported operations (views, seeds, Python models, `force_batch`).
+time: 2026-05-19T00:00:00.000000+00:00
+custom:
+  Author: amaingot
+  Issue: "1186"

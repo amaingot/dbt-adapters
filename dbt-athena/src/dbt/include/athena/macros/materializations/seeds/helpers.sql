@@ -191,6 +191,10 @@
 
 {% macro athena__create_csv_table(model, agate_table) %}
 
+  {%- if is_s3_tables_catalog(model.database) -%}
+    {% do exceptions.raise_compiler_error("Seeds are not supported for Athena S3 Tables catalogs. Load seed data via an alternative method (e.g. INSERT INTO from a staging table in a regular catalog).") %}
+  {%- endif -%}
+
   {%- set seed_by_insert = config.get('seed_by_insert', False) | as_bool -%}
 
   {%- if seed_by_insert -%}

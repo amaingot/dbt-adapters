@@ -6,8 +6,17 @@
   {%- set lf_tags_config = config.get('lf_tags_config') -%}
   {%- set lf_grants = config.get('lf_grants') -%}
 
-  {%- set table_type = config.get('table_type', default='hive') | lower -%}
-  {%- set is_s3_tables_catalog = database is not none and (database | lower).startswith('s3tablescatalog/') -%}
+  {%- set raw_table_type = config.get('table_type') -%}
+  {%- set is_s3_tables = is_s3_tables_catalog(database) -%}
+  {%- if is_s3_tables and raw_table_type is not none and raw_table_type | lower == 'hive' -%}
+    {% do exceptions.raise_compiler_error("Athena S3 Tables only supports Iceberg tables. Set table_type='iceberg' or omit it.") %}
+  {%- elif is_s3_tables -%}
+    {%- set table_type = 'iceberg' -%}
+  {%- else -%}
+    {%- set table_type = (raw_table_type or 'hive') | lower -%}
+  {%- endif -%}
+  {# persist resolved table_type so downstream macros see it #}
+  {%- do config.update({'table_type': table_type}) -%}
   {%- set old_relation = adapter.get_relation(database=database, schema=schema, identifier=identifier) -%}
   {%- set old_tmp_relation = adapter.get_relation(identifier=identifier ~ '__ha',
                                              schema=schema,
@@ -23,6 +32,12 @@
   {%- set versions_to_keep = config.get('versions_to_keep', default=4) -%}
   {%- set external_location = config.get('external_location', default=none) -%}
   {%- set force_batch = config.get('force_batch', False) | as_bool -%}
+  {%- if is_s3_tables and force_batch -%}
+    {% do exceptions.raise_compiler_error("force_batch is not supported with Athena S3 Tables.") %}
+  {%- endif -%}
+  {%- if is_s3_tables and language == 'python' -%}
+    {% do exceptions.raise_compiler_error("Python models targeting Athena S3 Tables are not yet supported.") %}
+  {%- endif -%}
   {%- set target_relation = api.Relation.create(identifier=identifier,
                                                 schema=schema,
                                                 database=database,
@@ -71,7 +86,7 @@
       -- delete glue tmp table, do not use drop_relation, as it will remove data of the target table
       {%- do adapter.delete_from_glue_catalog(tmp_relation) -%}
 
-      {% if not is_s3_tables_catalog %}
+      {% if not is_s3_tables %}
         {% do adapter.expire_glue_table_versions(target_relation, versions_to_keep, True) %}
       {% endif %}
 
@@ -102,7 +117,7 @@
           {{ query_result }}
         {% endcall %}
       {%- endif -%}
-    {%- elif is_s3_tables_catalog -%}
+    {%- elif is_s3_tables -%}
       -- Athena S3 Tables does not support `ALTER TABLE ... RENAME`, so we cannot do the normal
       -- Iceberg swap/backup behavior. Fall back to drop + create.
       {%- if old_tmp_relation is not none -%}

@@ -1,8 +1,21 @@
 {% materialization incremental, adapter='athena', supported_languages=['sql', 'python'] -%}
   {% set raw_strategy = config.get('incremental_strategy') or 'insert_overwrite' %}
   {% set is_microbatch = raw_strategy == 'microbatch' %}
-  {% set table_type = config.get('table_type', default='hive') | lower %}
+  {% set raw_table_type = config.get('table_type') %}
+  {% set is_s3_tables = is_s3_tables_catalog(database) %}
+  {%- if is_s3_tables and raw_table_type is not none and raw_table_type | lower == 'hive' -%}
+    {% do exceptions.raise_compiler_error("Athena S3 Tables only supports Iceberg tables. Set table_type='iceberg' or omit it.") %}
+  {%- elif is_s3_tables -%}
+    {%- set table_type = 'iceberg' -%}
+  {%- else -%}
+    {%- set table_type = (raw_table_type or 'hive') | lower -%}
+  {%- endif -%}
+  {# persist resolved table_type so downstream macros (e.g. on_schema_change) see it #}
+  {%- do config.update({'table_type': table_type}) -%}
   {% set model_language = model['language'] %}
+  {%- if is_s3_tables and model_language == 'python' -%}
+    {% do exceptions.raise_compiler_error("Python models targeting Athena S3 Tables are not yet supported.") %}
+  {%- endif -%}
   {% set strategy = validate_get_incremental_strategy(raw_strategy, table_type) %}
   {% set on_schema_change = incremental_validate_on_schema_change(config.get('on_schema_change'), default='ignore') %}
   {% set versions_to_keep = config.get('versions_to_keep', 1) | as_number %}
@@ -10,10 +23,12 @@
   {% set lf_grants = config.get('lf_grants') %}
   {% set partitioned_by = config.get('partitioned_by') %}
   {% set force_batch = config.get('force_batch', False) | as_bool -%}
+  {%- if is_s3_tables and force_batch -%}
+    {% do exceptions.raise_compiler_error("force_batch is not supported with Athena S3 Tables.") %}
+  {%- endif -%}
   {% set unique_tmp_table_suffix = config.get('unique_tmp_table_suffix', False) | as_bool -%}
   {% set temp_schema = config.get('temp_schema') %}
   {% set target_relation = this.incorporate(type='table') %}
-  {% set is_s3_tables_catalog = target_relation.database is not none and (target_relation.database | lower).startswith('s3tablescatalog/') %}
   {% set existing_relation = load_relation(this) %}
   {% set s3_data_naming = config.get('s3_data_naming', default=target.s3_data_naming) %}
   -- If using insert_overwrite on Hive table, allow to set a unique tmp table suffix
@@ -67,12 +82,14 @@
   -- Running in full refresh, support High Availability for Iceberg table type --
   -- Must use s3_data_naming schema_table_unique in order to support high availability --
   -- on a full fresh for an incremental iceberg table --
-	  {%- elif (
-	    should_full_refresh()
-	    and table_type == 'iceberg'
-	    and not is_s3_tables_catalog
-	    and ('unique' not in s3_data_naming or external_location is not none)
-	  ) -%}
+  -- S3 Tables full-refresh drops and recreates in the table namespace; the user cannot
+  -- control external_location or s3_data_naming, so the HA rename path is skipped.
+  {%- elif (
+    not is_s3_tables
+    and should_full_refresh()
+    and table_type == 'iceberg'
+    and ('unique' not in s3_data_naming or external_location is not none)
+  ) -%}
     -- create a new tmp_relation that has its s3 path set to the target location path
     -- except with a unique UUID
     -- this allows for once the fully refreshed `tmp_relation` is completed, the `rename_relation()`
@@ -248,7 +265,7 @@
 
   {% do persist_docs(target_relation, model) %}
 
-  {% if not is_s3_tables_catalog %}
+  {% if not is_s3_tables %}
     {% do adapter.expire_glue_table_versions(target_relation, versions_to_keep, False) %}
   {% endif %}
 

@@ -172,6 +172,15 @@ class AthenaAdapter(SQLAdapter):
     def date_function(cls) -> str:
         return "now()"
 
+    @available
+    def is_s3_tables_catalog(self, database: Optional[str]) -> bool:
+        """Return True if `database` refers to an Athena S3 Tables catalog.
+
+        S3 Tables catalogs are addressed in dbt via `database: s3tablescatalog/<bucket>`.
+        Exposed to Jinja so macros can branch on the target catalog kind.
+        """
+        return is_s3_tables_catalog(database)
+
     @classmethod
     def convert_text_type(cls, agate_table: agate.Table, col_idx: int) -> str:
         return "string"
@@ -1463,9 +1472,15 @@ class AthenaAdapter(SQLAdapter):
                 config=get_boto3_config(num_retries=creds.effective_num_retries),
             )
 
+        data_catalog = self._get_data_catalog(database)
+        catalog_id = get_catalog_id(data_catalog)
+        paginate_kwargs: Dict[str, Any] = {}
+        if catalog_id:
+            paginate_kwargs["CatalogId"] = catalog_id
+
         paginator = glue_client.get_paginator("get_databases")
         result = []
-        for page in paginator.paginate():
+        for page in paginator.paginate(**paginate_kwargs):
             result.extend([schema["Name"] for schema in page["DatabaseList"]])
         return result
 
